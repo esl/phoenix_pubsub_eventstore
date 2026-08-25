@@ -28,7 +28,7 @@ defmodule Phoenix.PubSub.EventStore do
   @behaviour Phoenix.PubSub.Adapter
   use GenServer
 
-  @metadata_fields [:source, :dispatcher, :destination_node, :source_node]
+  @metadata_fields [:source_id, :dispatcher, :destination_node, :source_node]
 
   @doc """
   Start the server
@@ -41,7 +41,6 @@ defmodule Phoenix.PubSub.EventStore do
 
   @doc false
   def init(opts) do
-    send(self(), :subscribe)
     id = generate_unique_id(opts)
 
     {:ok,
@@ -50,7 +49,7 @@ defmodule Phoenix.PubSub.EventStore do
        pubsub_name: opts[:name],
        eventstore: opts[:eventstore],
        serializer: opts[:serializer] || Phoenix.PubSub.EventStore.Serializer.Base64
-     }}
+     }, {:continue, :subscribe}}
   end
 
   defp generate_unique_id(opts) do
@@ -84,21 +83,33 @@ defmodule Phoenix.PubSub.EventStore do
   def handle_call(
         {:broadcast, topic, message, metadata},
         _from_pid,
-        %{id: id, eventstore: eventstore, serializer: serializer} = state
+        %{id: id, eventstore: eventstore, serializer: serializer, pubsub_name: pubsub_name} =
+          state
       ) do
     event = %EventStore.EventData{
       event_type: to_string(serializer),
       data: serializer.serialize(message),
-      metadata: Map.put(metadata, :source, id)
+      metadata: Map.put(metadata, :source_id, id)
     }
 
     res = eventstore.append_to_stream(topic, :any_version, [event])
+
+    # For direct_broadcast targeting the current node, the framework does not
+    # call local dispatch, so the adapter must do it. For regular broadcast,
+    # the framework handles local dispatch after adapter.broadcast returns :ok.
+    current_node = to_string(node())
+    destination_node = Map.get(metadata, :destination_node)
+
+    if destination_node == current_node do
+      dispatcher = Map.get(metadata, :dispatcher, Phoenix.PubSub)
+      Phoenix.PubSub.local_broadcast(pubsub_name, topic, message, dispatcher)
+    end
 
     {:reply, res, state}
   end
 
   @doc false
-  def handle_info(:subscribe, %{eventstore: eventstore} = state) do
+  def handle_continue(:subscribe, %{eventstore: eventstore} = state) do
     eventstore.subscribe("$all")
 
     {:noreply, state}
@@ -118,31 +129,26 @@ defmodule Phoenix.PubSub.EventStore do
          %EventStore.RecordedEvent{
            data: data,
            metadata: metadata,
-           stream_uuid: topic
+           stream_uuid: topic,
+           event_type: event_type
          },
          %{id: id, serializer: serializer, pubsub_name: pubsub_name} = _state
        ) do
     current_node = to_string(node())
 
-    case convert_metadata_keys_to_atoms(metadata) do
-      %{destination_node: destination_node}
-      when not is_nil(destination_node) and destination_node != current_node ->
-        # Direct broadcast and this is not the destination node.
-        :ok
+    %{source_id: source_id, destination_node: destination_node, dispatcher: dispatcher} =
+      convert_metadata_keys_to_atoms(metadata)
 
-      %{source: ^id} ->
-        # This node is the source, nothing to do, because local dispatch already
-        # happened.
-        :ok
+    is_destination? = is_nil(destination_node) or destination_node == current_node
 
-      %{dispatcher: dispatcher} ->
-        # Otherwise broadcast locally
-        Phoenix.PubSub.local_broadcast(
-          pubsub_name,
-          topic,
-          serializer.deserialize(data),
-          maybe_convert_to_existing_atom(dispatcher)
-        )
+    if not is_nil(dispatcher) and is_destination? and source_id != id and
+         event_type == to_string(serializer) do
+      Phoenix.PubSub.local_broadcast(
+        pubsub_name,
+        topic,
+        serializer.deserialize(data),
+        maybe_convert_to_existing_atom(dispatcher)
+      )
     end
   end
 

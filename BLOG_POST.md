@@ -2,24 +2,26 @@
 
 In distributed systems there is usually a need for the asynchronous transmission of messages to one or more services or processes. If you have used Phoenix you might have discovered that it provides a flexible way of solving this problem through a built-in pubsub framework called [Phoenix PubSub](https://hexdocs.pm/phoenix_pubsub/Phoenix.PubSub.html). Currently, it officially supports pubsub based on PG2 and Redis. It uses so called adapters to provide a pluggable interface for different pubsub implementations.
 
-In this blog post, we are going to show you the main steps of implementing an adapter for Phoenix PubSub. The example is written using version 2.0.0.
+This blog post covers the main steps of implementing an adapter for Phoenix PubSub. This will be an adapter for sending PubSub broadcasts with [EventStore](https://hexdocs.pm/eventstore/EventStore.html), an event sourcing library for Elixir that persists events to a PostgreSQL database as an append-only log.
 
-A full implementation of the adapter which is based on [EventStore](https://hexdocs.pm/eventstore/EventStore.html) can be found on Github at [laszlohegedus/phoenix_pubsub_eventstore](https://github.com/laszlohegedus/phoenix_pubsub_eventstore). The code discussed in this post is available on the master branch, while a version that works with phoenix_pubsub 1.1.2 is on branch v1.1.
+Using EventStore as a PubSub backend can give you a few advantages over the default PG2 adapter:
 
-To learn more about Elixir and related technologies you might want to check out [ElixirConf EU Virtual](https://virtual.elixirconf.eu/) taking pace 18-19 June.
+- **No Erlang distribution required**: nodes communicate through the shared database rather than through the Erlang cluster, so you can run multiple nodes without configuring Erlang node connectivity.
+- **Persistence**: every broadcast is stored and can be replayed or audited later.
+
+The tradeoffs are the need for storage and the additional latency of a database round-trip per broadcast, making it best suited for lower-throughput messaging where persistence and cross-node decoupling matter more than raw speed.
+
+A full implementation of the adapter can be found [on Github](https://github.com/laszlohegedus/phoenix_pubsub_eventstore).
+
+To learn more about Elixir and related technologies you might want to check out [ElixirConf EU Virtual](https://virtual.elixirconf.eu/) taking place 18-19 June.
 
 ## Phoenix.PubSub.Adapter in a nutshell
 
-A Phoenix PubSub adapter has to implement a few callbacks that are specified in the behaviour `Phoenix.PubSub.Adapter`:
+A Phoenix PubSub adapter has to implement a few callbacks that are specified in the behaviour [`Phoenix.PubSub.Adapter`](https://phoenix-pubsub.hexdocs.pm/Phoenix.PubSub.Adapter.html):
 
-- `node_name(adapter_name)`
-- `child_spec(keyword)`
-- `broadcast(adapter_name, topic, message, dispatcher)`
-- `direct_broadcast(adapter_name, node_name, topic, message, dispatcher)`
+### `node_name(adapter_name)`
 
-### Node name
-
-This function should return the node name as an atom or a binary. We did not discover too many uses for it, apart from the module `Phoenix.Tracker` and its implementations.
+This function should return the node name as an atom or a binary. There are not too many uses for it, apart from the module `Phoenix.Tracker` and its implementations.
 
 In most cases the following implementation should suffice:
 
@@ -28,48 +30,46 @@ def node_name(nil), do: node()
 def node_name(configured_name), do: configured_name
 ```
 
-### Child spec
+### `child_spec(keyword)`
 
-This function is used to generate the child spec for our adapter. Note that it is a default implementation for each GenServer, so usually it is not necessary to overwrite it.
+This callback is used to generate the child spec for the adapter. Note that it is a default implementation for each GenServer, so usually it is not necessary to overwrite it.
 
-### Broadcast
+### `broadcast(adapter_name, topic, message, dispatcher)`
 
-The function `broadcast` is called when a message is broadcast through `Phoenix.PubSub.broadcast`. The first paramater `adapter_name` is derived from the name we specify for the PubSub. We set the name (as an atom or module name) of the PubSub system when we initialize it. Note that the name of the PubSub is treated as a valid (not necessarily existing) module name, so it is better to follow the corresponding naming convention. The name of the adapter will come from the PubSub name with the suffix `.Adapter` added.
+This is called when a message is broadcast through `Phoenix.PubSub.broadcast`. The first parameter `adapter_name` is derived from the name specified for the PubSub — set as an atom or module name when initializing the PubSub system. Note that the name of the PubSub is treated as a valid (not necessarily existing) module name, so it is better to follow the corresponding naming convention. The name of the adapter will come from the PubSub name with the suffix `.Adapter` added (e.g. a `name` of `MyApp.PubSub` would have an `adapter_name` of `MyApp.PubSub.Adapter`).
 
 The `topic` and `message` parameters are self explanatory. The `dispatcher` is a module that is responsible for the local delivery of messages. It implements a `dispatch/3` function that will forward the messages to the subscribed processes.
 
-### Direct broadcast
+### `direct_broadcast(adapter_name, node_name, topic, message, dispatcher)`
 
-Direct Broadcast is similar to `broadcast` with an additional `node_name` parameter. When `direct_broadcast` is called, the message should only be broadcasted to subscribers on a given node.
+This is similar to `broadcast/4` with an additional `node_name` parameter. When `direct_broadcast` is called, the message should only be broadcast to subscribers on the given node.
 
-## EventStore adapter
+## The EventStore adapter
 
-We will walk through a possible implementation of a Phoenix PubSub adapter that uses EventStore to distribute the messages between nodes. This gives us a solution that does not depend on Erlang/Elixir distribution. Additionally, we'll have an event log stored in case further analysis is needed.
+This section walks through a possible implementation of a Phoenix PubSub adapter that uses EventStore to distribute messages between nodes. This gives a solution that does not depend on Erlang/Elixir distribution, and an event log is stored in case further analysis is needed.
 
-Note that I did not perform any load tests on this solution and it is not production-ready, mainly a proof of concept and an aid for demonstration.
-
-I mentioned above that we are going to use the latest master of [phoenixframework/phoenix_pubsub](https://github.com/phoenixframework/phoenix_pubsub) since it is cleaner and easier to use than the previous versions.
+Note that no load tests were performed on this solution and it is not production-ready, mainly a proof of concept and an aid for demonstration.
 
 ### Phoenix.PubSub
 
-In order to know how our adapter should work, it is worth looking into the code of the module `Phoenix.Pubsub`. It is well documented and clean, so it doesn't take too long to understand what each function does.
+To understand how the adapter should work, it is worth looking into the code of the module `Phoenix.PubSub`. It is well documented and clean, so it doesn't take too long to understand what each function does.
 
-The latest master version of Phoenix Pubsub makes use of [Registry](https://hexdocs.pm/elixir/Registry.html). Each subscription is an entry under the corresponding key in the registry associated with our PubSub adapter. That is, when we call `Phoenix.PubSub.subscribe(pubsub, topic, opts \\ [])`, a new entry is added to the registry with `Registry.register(pubsub, topic, opts[:metadata])`.
+`Phoenix.PubSub` makes use of Elixir's [Registry](https://hexdocs.pm/elixir/Registry.html) module. Each subscription is an entry under the corresponding key in the registry associated with the PubSub adapter. That is, when calling `Phoenix.PubSub.subscribe(pubsub, topic, opts \\ [])`, a new entry is added to the registry with `Registry.register(pubsub, topic, opts[:metadata])`.
 
 Duplicate subscriptions are allowed, but they will lead to duplicate delivery of messages. Unsubscribing from a topic removes all entries for the process under that topic.
 
-The main functionality we are going to deal with is `Phoenix.Pubsub.broadcast` and the similar `Phoenix.Pubsub.direct_broadcast`. Whenever these functions are called, two main things happen:
+The main functionality covered here is `Phoenix.PubSub.broadcast` and the similar `Phoenix.PubSub.direct_broadcast`. Whenever these functions are called, two main things happen:
 
-1) The `broadcast` or `direct_broadcast` function is called on the corresponding PubSub adapter and
+1) The `broadcast` or `direct_broadcast` callback is called on the corresponding PubSub adapter and
 2) if successful, the message is dispatched to local processes through the default or overridden dispatch method.
 
-This means that the main goal of our adapter's `broadcast` function is to make sure that the message gets delivered to the other nodes. In the case of a `direct_broadcast` the message should only be received by the subscribers on the given node and not others.
+This means that the main goal of the adapter's `broadcast` function is to make sure that the message gets delivered to the other nodes. In the case of a `direct_broadcast` the message should only be received by the subscribers on the given node and not others.
 
 ## The implementation
 
-First, we create a GenServer called Phoenix.PubSub.EventStore so we can easily stitch it into the PubSub supervision tree. We want to give the user the flexibility to specify which EventStore to use. To do this, we will expose an eventstore option to pass the desired EventStore module to the PubSub. We are going to store this in the state along with the name of the current instance of the pubsub adapter (the option `name` in the pubsub config). We will need both in the future.
+First, the adapter creates a GenServer called `Phoenix.PubSub.EventStore` to stitch into the PubSub supervision tree. To allow flexibility over which EventStore to use, an `eventstore` option is exposed to pass the desired EventStore module to the PubSub. This is stored in the state along with the name of the current adapter instance (the option `name` in the pubsub config) — both are needed later.
 
-In order to use our PubSub we have to add it to our supervision tree. This can be done as follows:
+To use this PubSub, it is added to the supervision tree:
 
 ```elixir
 {Phoenix.PubSub,
@@ -101,75 +101,73 @@ defmodule Phoenix.PubSub.EventStore do
 end
 ```
 
-Note the difference between `opts[:name]` and `opts[:adapter_name]`. The former is the name of the PubSub as a whole and is reserved for the Registry. Publishers use it when broadcasting messages. We can use `opts[:adapter_name]` as the name of our GenServer.
+Note the difference between `opts[:name]` and `opts[:adapter_name]`. The former is the name of the PubSub as a whole and is reserved for the Registry. Publishers use it when broadcasting messages. `opts[:adapter_name]` can be used as the name of the GenServer.
 
-The implementation is fairly simple. We have to make sure that our adapter can be used to broadcast messages to all subscribers. For this, we will make use of the event store.
+The implementation is fairly simple. The adapter must be able to broadcast messages to all subscribers, using the event store.
 
 ## Distributing a message as an event
 
-The first thing our GenServer has to do is append a new message to the event store when `broadcast/4` is called.
+The first thing the GenServer must do is append a new message to the event store when `broadcast/4` is called.
 
 ```elixir
-def broadcast(server, topic, message, dispatcher) do
-  GenServer.call(server, {:broadcast, topic, message})
+def broadcast(server, topic, message, dispatcher, metadata \\ %{}) do
+  metadata = Map.put(metadata, :dispatcher, dispatcher)
+  GenServer.call(server, {:broadcast, topic, message, metadata})
 end
 
 def handle_call(
-      {:broadcast, topic, message},
+      {:broadcast, topic, message, metadata},
       _from_pid,
-      %{eventstore: eventstore} = state
+      %{id: id, eventstore: eventstore, serializer: serializer, pubsub_name: pubsub_name} = state
     ) do
   event = %EventStore.EventData{...}
 
   res = eventstore.append_to_stream(topic, :any_version, [event])
 
+  # For direct_broadcast targeting the current node, the framework does not
+  # call local dispatch, so the adapter must do it. For regular broadcast,
+  # the framework handles local dispatch after adapter.broadcast returns :ok.
+  current_node = to_string(node())
+  destination_node = Map.get(metadata, :destination_node)
+
+  if destination_node == current_node do
+    dispatcher = Map.get(metadata, :dispatcher, Phoenix.PubSub)
+    Phoenix.PubSub.local_broadcast(pubsub_name, topic, message, dispatcher)
+  end
+
   {:reply, res, state}
 end
 ```
 
-This is where we have to decide how we want to wrap the message inside an `%EventStore.EventData{}` struct. An easy solution is to serialise the message as one field. For this, we'll have to introduce a struct that will hold this field:
-
-```elixir
-defmodule Phoenix.PubSub.EventStore.Data do
-  defstruct [:payload]
-end
-```
-
-Then our message can be written as:
+The key decision here is how to wrap the message inside an `%EventStore.EventData{}` struct. Serialization is handled by a pluggable module (defaulting to `Phoenix.PubSub.EventStore.Serializer.Base64`) so the adapter is not tied to a specific encoding. The default serializer base64-encodes `:erlang.term_to_binary/1` output — this is necessary because EventStore stores data as JSON and raw binaries would be invalid, and because JSON cannot distinguish atoms from strings so a round-trip through term serialization preserves type fidelity.
 
 ```elixir
 event = %EventStore.EventData{
-  event_type: "Elixir.Phoenix.PubSub.EventStore.Data",
-  data: %Phoenix.PubSub.EventStore.Data{
-    payload: Base.encode64(:erlang.term_to_binary(message))
-  }
+  event_type: to_string(serializer),
+  data: serializer.serialize(message)
 }
 ```
 
-Note that EventStore converts the data to JSON and if we only used `:erlang.term_to_binary` then we would likely have invalid JSONs, so an additional base64 encoding is required. You may wonder why we need to convert the payload to a binary. This is needed because JSON cannot differentiate between atoms and strings, so each atom would appear as a string in the published message. If we want consistency, we have to make sure to serialise and deserialise the payload.
+A custom serializer can be provided via the `serializer` option as long as it implements `serialize/1` and `deserialize/1`.
 
-Another way to partially solve this would be to force the user to use structs when sending messages. That way EventStore would be able to do ser-des. Note that the keys remain atoms, but any value that was originally an atom will be converted to a string, so some post processing is still required.
-
-Unless the messages are huge the base64 encoded binary should suffice.
+A custom ID generator can be provided via `unique_id_fn` — a function that receives the PubSub name and returns a unique string. Useful when UUID is unavailable or when a deterministic ID is needed for testing.
 
 ## Handling events, local distribution
 
-Now that the events are in the event store, any process that is subscribed to corresponding topics will receive them. First, we have to make sure that our GenServer (`Phoenix.PubSub.EventStore`) subscribes to all topics (`"$all"`). If you also want to use an event store for a different purpose, it's best to have a separate one for pubsub. We can easily do the subscription by sending a message to `self()`, then handling it in `handle_info` right after the server starts.
+Now that events are in the event store, any subscribed process will receive them. The GenServer (`Phoenix.PubSub.EventStore`) must subscribe to all topics (`"$all"`). If the event store is also used for another purpose, it's best to have a separate one for pubsub. The subscription is set up via `handle_continue/2`, which runs immediately after `init/1` completes, before any other messages can be processed.
 
 ```elixir
 def init(opts) do
-  send(self(), :subscribe)
-
   {:ok,
    %{
      eventstore: opts[:eventstore],
      pubsub_name: opts[:name]
-   }}
+   }, {:continue, :subscribe}}
 end
 
 #...#
 
-def handle_info(:subscribe, %{eventstore: eventstore} = state) do
+def handle_continue(:subscribe, %{eventstore: eventstore} = state) do
   eventstore.subscribe("$all")
 
   {:noreply, state}
@@ -178,50 +176,40 @@ end
 def handle_info({:subscribed, _subscription}, state), do: {:noreply, state}
 ```
 
-We use a transient subscription, because we do not care about previous messages. The event store will reply with a `{:subscribed, subscription}` message, which we'll also have to handle. After this, the server will start receiving `{:events, events}` messages.
+A transient subscription is used since previous messages are not needed. The event store replies with a `{:subscribed, subscription}` message, which must also be handled. After this, the server will start receiving `{:events, events}` messages.
 
-Note that when a message is broadcast on a node, it will be distributed to local subscribers by `Phoenix.PubSub` right after our adapter returns from `broadcast/4` as seen in the implementation:
+In Phoenix.PubSub 2.x the adapter owns local dispatch — it must call `Phoenix.PubSub.local_broadcast` itself rather than relying on the framework to do it after `broadcast/4` returns.
 
-```elixir
-# from Phoenix.PubSub #
-def broadcast(pubsub, topic, message, dispatcher \\ __MODULE__)
-    when is_atom(pubsub) and is_binary(topic) and is_atom(dispatcher) do
-  {:ok, {adapter, name}} = Registry.meta(pubsub, :pubsub)
-
-  with :ok <- adapter.broadcast(name, topic, message, dispatcher) do
-    dispatch(pubsub, :none, topic, message, dispatcher)
-  end
-end
-```
-
-So we have to make sure that a local message is not dispatched twice. For that we can add a unique ID (I went with `UUID.uuid1()`) to the process state:
+To avoid dispatching a local message twice (once from `broadcast/4` and once when the event arrives back from EventStore), a unique ID is added to the process state:
 
 ```elixir
 def init(opts) do
-  send(self(), :subscribe)
-
   {:ok,
    %{
-     id: UUID.uuid1(),
+     id: generate_unique_id(opts),
      eventstore: opts[:eventstore],
-     pubsub_name: opts[:name]
-   }}
+     pubsub_name: opts[:name],
+     serializer: opts[:serializer] || Phoenix.PubSub.EventStore.Serializer.Base64
+   }, {:continue, :subscribe}}
+end
+
+defp generate_unique_id(opts) do
+  unique_id_fn = opts[:unique_id_fn] || fn _name -> UUID.uuid4() end
+  unique_id_fn.(opts[:name])
 end
 ```
 
-Now, we can just add the `id` to the event before publishing it into the event store. I chose to put it in the `metadata` field, but we could also wrap it inside `data`. Although it's best to keep this information separate from the actual message. Finally, we'll have to change the `handle_call` for `:broadcast` and add the `id` to the event:
+The `id` is added to the event's `metadata` field as `source_id`, keeping it separate from the message data. Serialization is delegated to the configurable `serializer` module. The `handle_call` for `:broadcast` becomes:
 
 ```elixir
 event = %EventStore.EventData{
-  event_type: "Elixir.Phoenix.PubSub.EventStore.Data",
-  data: %Phoenix.PubSub.EventStore.Data{
-    payload: Base.encode64(:erlang.term_to_binary(message))
-  }
-  metadata: %{source: id}
+  event_type: to_string(serializer),
+  data: serializer.serialize(message),
+  metadata: Map.put(metadata, :source_id, id)
 }
 ```
 
-Where the value of `id` comes from the state. Now when we recive an event we know where it came from and we can decide whether it is needed to be dispatched to local subscribers.
+Where the value of `id` and `serializer` come from the state, and `metadata` already contains `dispatcher` and any `destination_node` for direct broadcasts. When an event arrives back, `source_id` identifies the origin node so duplicates can be skipped:
 
 ```elixir
 def handle_info({:events, events}, state) do
@@ -232,34 +220,32 @@ end
 
 defp local_broadcast_event(
        %EventStore.RecordedEvent{
-         event_type: "Elixir.Phoenix.PubSub.EventStore.Data",
-         data: %Phoenix.PubSub.EventStore.Data{
-           payload: payload
-         },
+         data: data,
          metadata: metadata,
-         stream_uuid: topic
+         stream_uuid: topic,
+         event_type: event_type
        },
-       %{id: id, pubsub_name: pubsub_name} = _state
+       %{id: id, serializer: serializer, pubsub_name: pubsub_name} = _state
      ) do
-  case metadata do
-    %{"source" => ^id} ->
-      # This node is the source, nothing to do, because local dispatch already
-      # happened.
-      :ok
+  current_node = to_string(node())
 
-    _not_local ->
-      # Otherwise broadcast locally
-      message = :erlang.binary_to_term(Base.decode64(payload))
+  %{source_id: source_id, destination_node: destination_node, dispatcher: dispatcher} =
+    convert_metadata_keys_to_atoms(metadata)
 
-      Phoenix.PubSub.local_broadcast(
-        pubsub_name,
-        topic,
-        message
-      )
+  is_destination? = is_nil(destination_node) or destination_node == current_node
+
+  if not is_nil(dispatcher) and is_destination? and source_id != id and
+       event_type == to_string(serializer) do
+    Phoenix.PubSub.local_broadcast(
+      pubsub_name,
+      topic,
+      serializer.deserialize(data),
+      maybe_convert_to_existing_atom(dispatcher)
+    )
   end
 end
 ```
 
-That's it. This should give us enough to have a simple implementation of Phoenix Pubsub using EventStore. Note that the implementation of direct broadcast is still missing, which I solved by adding the destination node to the metadata field and extending the function `local_broadcast_event` to handle it. I also added support for handling the `dispatch` field during broadcasts.
+That's it — a complete implementation of Phoenix PubSub using EventStore, including support for `direct_broadcast` via the `destination_node` metadata field and pluggable serialization.
 
-For my complete implementation consult [laszlohegedus/phoenix_pubsub_eventstore](https://github.com/laszlohegedus/phoenix_pubsub_eventstore).
+The complete implementation can be found at [laszlohegedus/phoenix_pubsub_eventstore](https://github.com/laszlohegedus/phoenix_pubsub_eventstore).

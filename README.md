@@ -17,3 +17,19 @@ Add `Phoenix.PubSub` to your supervision tree by specifying `Phoenix.PubSub.Even
 ```
 
 You should have `MyApp.EventStore` configured separately. Consult the [EventStore](https://hexdocs.pm/eventstore/EventStore.html) documentation for hints. Make sure that `MyApp.EventStore` is started **before** the PubSub.
+
+## Development
+
+Requires PostgreSQL running locally with a `postgres` superuser.
+
+Create and initialize the EventStore database for the test environment:
+
+```sh
+MIX_ENV=test mix event_store.create + event_store.init
+```
+
+Then run tests:
+
+```sh
+mix test
+```
